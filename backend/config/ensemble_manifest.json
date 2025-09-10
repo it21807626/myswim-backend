@@ -1,0 +1,19 @@
+{
+  "type": "average",
+  "models": [
+    { "path": "models/cnn1d_anysafe_balanced.h5", "kind": "1d" },
+    { "path": "models/cnn2d_anysafe_improved.h5", "kind": "2d", "channels": 1 }
+  ],
+  "ensemble": {
+    "kind": "model",
+    "path": "models/ensemble_avg.h5",
+    "input": "probs",
+    "aggregate": "max",
+    "threshold": 0.463
+  },
+  "window": 30,
+  "stride": 15
+}
+
+
+ 

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.ipynb
+.ipynb_checkpoints/
+
+# Experiments / local artifacts
+convert/
+convert38/
+*.pyd
+*.dll
+*.so
+
+# Misc
+build/
+dist/
+tmp/
+.DS_Store

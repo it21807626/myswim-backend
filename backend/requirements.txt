@@ -1,0 +1,16 @@
+# Web
+flask==3.0.3
+flask-cors==4.0.1
+gunicorn==22.0.0
+
+# Core ML stack pinned for TF 2.11
+tensorflow==2.11.1
+numpy==1.23.5
+protobuf==3.20.3
+h5py==3.8.0
+
+# Video & Pose
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.14
+absl-py==2.1.0
+
