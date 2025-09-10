@@ -2,12 +2,28 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
+
 import tensorflow as tf
+from tensorflow import keras as K
 
 # -----------------------------
 # No legacy flags/shims needed!
 # This env is TF 2.11 + tf.keras.
 # -----------------------------
+class PatchedInputLayer(K.layers.InputLayer):
+    @classmethod
+    def from_config(cls, config):
+        # map legacy key
+        if "batch_shape" in config and "batch_input_shape" not in config:
+            config["batch_input_shape"] = config.pop("batch_shape")
+        return super().from_config(config)
+
+CUSTOMS = {
+    "InputLayer": PatchedInputLayer
+    # you likely do NOT need a DTypePolicy shim on TF/Keras 2.13,
+    # but this is harmless if present:
+    # "DTypePolicy": tf.keras.mixed_precision.Policy,
+}
 
 app = Flask(__name__)
 CORS(app)
@@ -32,14 +48,15 @@ ENSEMBLE_CFG = MANIFEST.get("ensemble", {})
 AGGREGATE = ENSEMBLE_CFG.get("aggregate", MANIFEST.get("aggregate", "max")).lower()
 
 # ---- Load models (plain .h5) ----
-MODEL_1D = tf.keras.models.load_model(M1D_PATH, compile=False)
-MODEL_2D = tf.keras.models.load_model(M2D_PATH, compile=False)
+MODEL_1D = tf.keras.models.load_model(M1D_PATH, compile=False, custom_objects=CUSTOMS)
+MODEL_2D = tf.keras.models.load_model(M2D_PATH, compile=False, custom_objects=CUSTOMS)
+
 
 ENSEMBLE_MODEL = None
 if ENSEMBLE_CFG.get("kind") == "model":
     ens_path = ENSEMBLE_CFG.get("path")
     if ens_path and os.path.exists(ens_path):
-        ENSEMBLE_MODEL = tf.keras.models.load_model(ens_path, compile=False)
+        ENSEMBLE_MODEL = tf.keras.models.load_model(ens_path, compile=False, custom_objects=CUSTOMS)
 
 # ---- Load normalization stats ----
 norm1d = np.load(os.path.join("norm", "cnn1d_data_anysafe.npz"))
