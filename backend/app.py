@@ -4,6 +4,7 @@ from flask_cors import CORS
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras as K
+from tensorflow.keras import mixed_precision as mp 
 
 # ---- Patch legacy InputLayer configs (batch_shape -> batch_input_shape)
 class PatchedInputLayer(K.layers.InputLayer):
@@ -13,7 +14,7 @@ class PatchedInputLayer(K.layers.InputLayer):
             config["batch_input_shape"] = config.pop("batch_shape")
         return super().from_config(config)
 
-CUSTOMS = {"InputLayer": PatchedInputLayer}
+CUSTOMS = {"InputLayer": PatchedInputLayer, "DTypePolicy": mp.Policy}
 
 app = Flask(__name__)
 CORS(app)
