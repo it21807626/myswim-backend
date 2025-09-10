@@ -1,16 +1,13 @@
-# API
 flask==3.0.3
 flask-cors==4.0.1
 gunicorn==22.0.0
 
-# Core ML stack (compatible set for Linux/Python 3.10 on Render)
 tensorflow==2.13.1
 numpy==1.24.3
-protobuf==3.20.3
+protobuf==4.25.3
 h5py==3.8.0
 grpcio==1.56.2
 
-# Vision / pose
 opencv-python-headless==4.10.0.84
 mediapipe==0.10.14
 
