@@ -46,11 +46,9 @@ def _safe_load_models():
     global MODEL_1D, MODEL_2D, ENSEMBLE_MODEL, _LAST_LOAD_ERR
     if MODEL_1D is not None and MODEL_2D is not None:
         return True
-
     try:
         MODEL_1D = tf.keras.models.load_model(M1D_PATH, compile=False, custom_objects=CUSTOMS)
         MODEL_2D = tf.keras.models.load_model(M2D_PATH, compile=False, custom_objects=CUSTOMS)
-        # Optional ensemble
         if ENSEMBLE_CFG.get("kind") == "model":
             ens_path = ENSEMBLE_CFG.get("path")
             if ens_path and os.path.exists(ens_path):
@@ -59,19 +57,52 @@ def _safe_load_models():
         return True
     except Exception as e:
         _LAST_LOAD_ERR = f"{type(e).__name__}: {e}"
-        # keep models as None so we can retry on next request
         MODEL_1D = None
         MODEL_2D = None
         ENSEMBLE_MODEL = None
         return False
 
-# ---------- Norm stats ----------
-def _load_norm():
-    n1 = np.load(os.path.join("norm", "cnn1d_data_anysafe.npz"))
-    n2 = np.load(os.path.join("norm", "cnn2d_data_anysafe.npz"))
-    return (n1["mu"], n1["sigma"]), (n2["mu"], n2["sigma"])
+# ---------- Robust norm helpers (LAZY) ----------
+def _pick_key(npz, *candidates):
+    """Return first existing key from candidates, else None."""
+    for k in candidates:
+        if k in npz.files:
+            return k
+    return None
 
-(MU1D, SIG1D), (MU2D, SIG2D) = _load_norm()
+def _load_norm_file(path):
+    """
+    Tries common key names:
+      mean keys:  'mu', 'mean', 'avg'
+      std  keys:  'sigma', 'std', 'stddev', 'stdev'
+    Falls back to (mu zeros, sigma ones) if missing.
+    """
+    mu = None
+    sigma = None
+    try:
+        npz = np.load(path)
+        k_mu = _pick_key(npz, "mu", "mean", "avg")
+        k_sg = _pick_key(npz, "sigma", "std", "stddev", "stdev")
+        if k_mu is not None:
+            mu = np.array(npz[k_mu], dtype=np.float32)
+        if k_sg is not None:
+            sigma = np.array(npz[k_sg], dtype=np.float32)
+    except Exception:
+        pass
+    return mu, sigma  # may contain None
+
+def _ensure_mu_sigma(mu, sigma, feature_shape):
+    """
+    If mu/sigma missing, create broadcastable defaults for given feature_shape.
+    feature_shape is a tuple describing the last dims we normalize against
+      - for 1D windows: (4,)
+      - for 2D windows: (4,1) or just (4,)
+    """
+    if mu is None:
+        mu = np.zeros(feature_shape, dtype=np.float32)
+    if sigma is None:
+        sigma = np.ones(feature_shape, dtype=np.float32)
+    return mu, sigma
 
 def normalize(arr, mu, sigma, eps=1e-6):
     return (arr - mu) / (sigma + eps)
@@ -86,7 +117,6 @@ def combine_window_probs(p1, p2):
         X = np.stack([_to_logits(p1), _to_logits(p2)], axis=1) if use_logits else np.stack([p1, p2], axis=1)
         y = ENSEMBLE_MODEL.predict(X, verbose=0).squeeze()
         return np.atleast_1d(y).astype(float)
-    # default: average
     return (0.5 * p1 + 0.5 * p2).astype(float)
 
 def aggregate_clip(win_probs):
@@ -102,6 +132,7 @@ def root():
 
 @app.get("/health")
 def health():
+    # models may not be loaded yet; norms are loaded in /predict
     return jsonify({
         "ok": True,
         "models_ready": (MODEL_1D is not None and MODEL_2D is not None),
@@ -115,7 +146,7 @@ def health():
 
 @app.post("/predict")
 def predict():
-    # Only JSON mode here. Send { "x1d": [ [ [..4..]*T ]*N ] , "window_ids": ... }
+    # Load models on-demand
     if not _safe_load_models():
         return jsonify({"error": "Model load failed", "detail": _LAST_LOAD_ERR}), 500
 
@@ -127,7 +158,7 @@ def predict():
     if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
         return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}"}), 400
 
-    # Build a basic 2D representation [N,T,4,1] by per-window min-max scale
+    # Build a simple 2D representation [N,T,4,1] via per-window min-max scale
     def to2d_batch(x1d):
         out = []
         for w in x1d:
@@ -138,9 +169,18 @@ def predict():
 
     x2d_raw = to2d_batch(x1d_raw)
 
-    # Normalize by training stats
-    x1d = normalize(x1d_raw, MU1D, SIG1D)
-    x2d = normalize(x2d_raw, MU2D, SIG2D)
+    # ---- Load norms now (robust) and ensure shapes are broadcastable
+    mu1, sg1 = _load_norm_file(os.path.join("norm", "cnn1d_data_anysafe.npz"))
+    mu2, sg2 = _load_norm_file(os.path.join("norm", "cnn2d_data_anysafe.npz"))
+
+    # feature shapes to normalize across last dims
+    mu1, sg1 = _ensure_mu_sigma(mu1, sg1, feature_shape=(4,))
+    # for 2D we can normalize per-channel; both (4,) or (4,1) will broadcast
+    mu2, sg2 = _ensure_mu_sigma(mu2, sg2, feature_shape=(4,))
+
+    x1d = normalize(x1d_raw, mu1, sg1)
+    x2d = normalize(x2d_raw, mu2[..., None] if mu2.ndim == 1 else mu2,
+                              sg2[..., None] if sg2.ndim == 1 else sg2)
 
     try:
         p1 = np.atleast_1d(MODEL_1D.predict(x1d, verbose=0).squeeze())
