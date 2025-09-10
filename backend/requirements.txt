@@ -2,13 +2,15 @@ flask==3.0.3
 flask-cors==4.0.1
 gunicorn==22.0.0
 
+# ML stack pinned for Linux/Py3.10 on Render
 tensorflow==2.13.1
-numpy==1.24.3
+numpy==1.23.5
 protobuf==4.25.3
 h5py==3.8.0
-grpcio==1.56.2
+grpcio==1.51.3
 
 opencv-python-headless==4.10.0.84
 mediapipe==0.10.14
+
 
 
