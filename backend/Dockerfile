@@ -29,4 +29,9 @@ ENV PORT=5000
 # Gunicorn entry (use threads for I/O bound)
 CMD exec gunicorn -w 2 -k gthread -t 180 -b 0.0.0.0:${PORT} app:app
 
+ENV TF_CPP_MIN_LOG_LEVEL=2
+ENV PYTHONUNBUFFERED=1
+
+# Gunicorn serving Flask app: app.py exposes 'app'
+CMD gunicorn -b 0.0.0.0:$PORT -w 2 -k gthread app:app
  
