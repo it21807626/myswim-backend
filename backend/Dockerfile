@@ -1,37 +1,29 @@
-# ---- Base: pick a TF/Keras sweet spot for legacy .h5 ----
+# ---- Base: Python 3.10 works well with TF/Keras + your .h5 files
 FROM python:3.10-slim
 
-# System deps for OpenCV / MediaPipe / video I/O
+# OS deps for OpenCV/MediaPipe/video I/O
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libsm6 libxext6 libgl1 libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
-# Prevent Python from buffering logs
+# Environment
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    TF_CPP_MIN_LOG_LEVEL=2 \
+    PORT=5000
 
-# Create workspace
+# Workdir
 WORKDIR /app
 
-# Copy requirement pins first (better Docker layer cache)
-COPY requirements.txt /app/
-
-# Install Python deps (more robust)
-ENV PIP_DEFAULT_TIMEOUT=120
+# Install Python deps (keep this separate for better cache)
+COPY requirements.txt ./
 RUN python -m pip install --upgrade pip && \
-    pip install --no-cache-dir --retries 5 --timeout 120 -r requirements.txt
+    pip install -r requirements.txt
 
+# Copy the rest of the backend (app.py, models/, config/, norm/, gunicorn_start.sh, etc.)
+COPY . .
 
-# Copy the rest of your backend (app.py, models/, config/, norm/, etc.)
-COPY . /app/
+# Start with our wrapper (forces workers=1/threads=1)
+CMD ["bash", "gunicorn_start.sh"]
 
-# Render sets $PORT for us; default to 5000 locally
-ENV PORT=5000
-
-
-ENV TF_CPP_MIN_LOG_LEVEL=2
-ENV PYTHONUNBUFFERED=1
-
-# Gunicorn serving Flask app: app.py exposes 'app'
-CMD gunicorn -b 0.0.0.0:$PORT -w 2 -k gthread app:app
  
