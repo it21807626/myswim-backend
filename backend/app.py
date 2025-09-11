@@ -214,6 +214,19 @@ def health():
         "threshold": get_threshold(),
     })
 
+# NEW: warmup endpoint to preload models (prevents cold-start surprises)
+@app.get("/warmup")
+def warmup():
+    global _LAST_LOAD_ERR
+    try:
+        get_model_1d()
+        get_model_2d()
+        _LAST_LOAD_ERR = None
+        return jsonify({"ok": True, "models_ready": True})
+    except Exception as e:
+        _LAST_LOAD_ERR = f"{type(e).__name__}: {e}"
+        return jsonify({"ok": False, "models_ready": False, "error": _LAST_LOAD_ERR}), 500
+
 # helper used by both routes
 def to2d_batch_strict(x1d):
     """Return [N,T,4,1]. Collapse any accidental channels to 1."""
@@ -308,3 +321,4 @@ def predict():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+
