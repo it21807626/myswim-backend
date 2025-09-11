@@ -23,6 +23,9 @@ RUN python -m pip install --upgrade pip && \
 # Copy the rest of the backend (app.py, models/, config/, norm/, gunicorn_start.sh, etc.)
 COPY . .
 
+RUN chmod +x gunicorn_start.sh
+
+
 # Start with our wrapper (forces workers=1/threads=1)
 CMD ["bash", "gunicorn_start.sh"]
 
