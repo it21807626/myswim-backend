@@ -1,4 +1,4 @@
-import os, json
+import os, json, threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
@@ -26,6 +26,9 @@ def _shape(x):
         return list(x.shape)
     except Exception:
         return None
+
+def _pid_tid():
+    return {"pid": os.getpid(), "thread": threading.get_ident()}
 
 # ---------- Config & manifest ----------
 with open(os.path.join("config", "ensemble_manifest.json"), "r") as f:
@@ -78,10 +81,6 @@ def _to_logits(p, eps=1e-7):
 
 # Force 2D stats to broadcast as (1,1,4,1) against x2d [N,T,4,1]
 def _as_2d_stat(arr_1d_or_2d):
-    """
-    Convert mu/sigma arrays like (4,), (4,1), (1,4) into shape (1,1,4,1)
-    so broadcasting preserves the final channel dimension = 1.
-    """
     a = np.array(arr_1d_or_2d, dtype=np.float32)
     if a.ndim == 1:            # (4,)
         a = a.reshape(1, 1, 4, 1)
@@ -150,10 +149,6 @@ def build_cnn2d(input_shape=(30, 4, 1)):
     return K.Model(x_in, out, name="functional_3")
 
 def robust_load_or_rebuild(h5_path: str, kind: str):
-    """
-    Try normal load_model (with CUSTOMS). If legacy-graph errors occur,
-    rebuild the architecture and load only weights by name.
-    """
     try:
         return tf.keras.models.load_model(h5_path, compile=False, custom_objects=CUSTOMS)
     except Exception:
@@ -201,6 +196,10 @@ def get_model_2d():
 def root():
     return jsonify({"message": "myswim backend up", "tf": tf.__version__})
 
+@app.get("/whoami")
+def whoami():
+    return jsonify(_pid_tid())
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -212,35 +211,22 @@ def health():
         "stride": STRIDE,
         "aggregate": AGGREGATE,
         "threshold": get_threshold(),
+        **_pid_tid(),
     })
 
-# NEW: warmup endpoint to preload models (prevents cold-start surprises)
-@app.get("/warmup")
-def warmup():
-    global _LAST_LOAD_ERR
-    try:
-        get_model_1d()
-        get_model_2d()
-        _LAST_LOAD_ERR = None
-        return jsonify({"ok": True, "models_ready": True})
-    except Exception as e:
-        _LAST_LOAD_ERR = f"{type(e).__name__}: {e}"
-        return jsonify({"ok": False, "models_ready": False, "error": _LAST_LOAD_ERR}), 500
-
-# helper used by both routes
 def to2d_batch_strict(x1d):
     """Return [N,T,4,1]. Collapse any accidental channels to 1."""
     out = []
-    for w in x1d:                                # w: [T,4]
+    for w in x1d:
         mn, mx = float(np.min(w)), float(np.max(w))
         scale = (mx - mn) if (mx > mn) else 1.0
-        normed = (w - mn) / (scale + 1e-6)       # [T,4]
-        out.append(normed[..., None])            # [T,4,1]
-    x2d = np.array(out, dtype=np.float32)        # [N,T,4,1]
+        normed = (w - mn) / (scale + 1e-6)
+        out.append(normed[..., None])
+    x2d = np.array(out, dtype=np.float32)
     if x2d.ndim == 3:
-        x2d = x2d[..., None]                     # ensure last dim exists
+        x2d = x2d[..., None]
     if x2d.shape[-1] != 1:
-        x2d = np.mean(x2d, axis=-1, keepdims=True)  # collapse -> 1 channel
+        x2d = np.mean(x2d, axis=-1, keepdims=True)
     return x2d
 
 @app.post("/echo-shapes")
@@ -248,7 +234,16 @@ def echo_shapes():
     payload = request.get_json(silent=True) or {}
     x1d_raw = np.array(payload.get("x1d", []), dtype=np.float32)
     x2d_raw = to2d_batch_strict(x1d_raw)
-    return jsonify({"x1d_raw": _shape(x1d_raw), "x2d_raw": _shape(x2d_raw)})
+    return jsonify({"x1d_raw": _shape(x1d_raw), "x2d_raw": _shape(x2d_raw), **_pid_tid()})
+
+@app.get("/warmup")
+def warmup():
+    try:
+        _ = get_model_1d()
+        _ = get_model_2d()
+        return jsonify({"ok": True, "models_ready": True, **_pid_tid()})
+    except Exception as e:
+        return jsonify({"ok": False, "models_ready": False, "error": f"{type(e).__name__}: {e}", **_pid_tid()}), 500
 
 @app.post("/predict")
 def predict():
@@ -257,16 +252,16 @@ def predict():
         model_1d = get_model_1d()
         model_2d = get_model_2d()
     except Exception as e:
-        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}", **_pid_tid()}), 500
 
     # 2) Read payload
     payload = request.get_json(silent=True)
     if not payload or "x1d" not in payload:
-        return jsonify({"error": "Send JSON with key 'x1d' shaped [N,T,4]"}), 400
+        return jsonify({"error": "Send JSON with key 'x1d' shaped [N,T,4]", **_pid_tid()}), 400
 
     x1d_raw = np.array(payload["x1d"], dtype=np.float32)
     if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
-        return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}"}), 400
+        return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}", **_pid_tid()}), 400
 
     # 3) Build strict 2D [N,T,4,1]
     x2d_raw = to2d_batch_strict(x1d_raw)
@@ -291,6 +286,7 @@ def predict():
             "x2d_raw": _shape(x2d_raw),
             "x1d": _shape(x1d),
             "x2d": _shape(x2d),
+            **_pid_tid(),
         })
 
     # 5) Inference
@@ -298,7 +294,7 @@ def predict():
         p1 = np.atleast_1d(model_1d.predict(x1d, verbose=0).squeeze())
         p2 = np.atleast_1d(model_2d.predict(x2d, verbose=0).squeeze())
     except Exception as e:
-        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}", **_pid_tid()}), 500
 
     n = min(len(p1), len(p2))
     p1, p2 = p1[:n], p2[:n]
@@ -316,9 +312,11 @@ def predict():
         "th": float(th),
         "window_probs": [float(v) for v in win_probs],
         "model_probs": {"p1d_mean": float(np.mean(p1)), "p2d_mean": float(np.mean(p2))},
-        "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE}
+        "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE},
+        **_pid_tid(),
     })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+
 
