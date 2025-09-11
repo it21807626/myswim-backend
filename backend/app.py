@@ -20,6 +20,13 @@ CUSTOMS = {"InputLayer": PatchedInputLayer, "DTypePolicy": mp.Policy}
 app = Flask(__name__)
 CORS(app)
 
+# ---------- small debug util ----------
+def _shape(x):
+    try:
+        return list(x.shape)
+    except Exception:
+        return None
+
 # ---------- Config & manifest ----------
 with open(os.path.join("config", "ensemble_manifest.json"), "r") as f:
     MANIFEST = json.load(f)
@@ -70,7 +77,7 @@ def _to_logits(p, eps=1e-7):
     return np.log(p/(1.-p))
 
 # ---------- Ensemble combine ----------
-ENSEMBLE_MODEL = None  # (optional) if you later want to lazy-load an ensemble model
+ENSEMBLE_MODEL = None  # optional
 def combine_window_probs(p1, p2):
     if ENSEMBLE_CFG.get("kind") == "model" and ENSEMBLE_MODEL is not None:
         use_logits = ENSEMBLE_CFG.get("input", "probs") == "logits"
@@ -86,7 +93,7 @@ def get_threshold():
     th = ENSEMBLE_CFG.get("threshold", MANIFEST.get("threshold_risky", 0.463))
     return float(th)
 
-# ---------- Model builders (match your old layer names/shapes) ----------
+# ---------- Model builders (fallback when load_model fails) ----------
 def build_cnn1d(input_shape=(30, 4)):
     x_in = K.layers.Input(shape=input_shape, name="input_layer")
     x = K.layers.Conv1D(64, 7, padding="same", activation="relu", name="conv1d")(x_in)
@@ -132,7 +139,6 @@ def robust_load_or_rebuild(h5_path: str, kind: str):
             model = build_cnn2d()
         else:
             raise RuntimeError(f"Unknown kind: {kind}")
-        # First try strict by_name load; if that fails, allow skip_mismatch
         try:
             model.load_weights(h5_path, by_name=True, skip_mismatch=False)
         except Exception:
@@ -184,6 +190,29 @@ def health():
         "threshold": get_threshold(),
     })
 
+# helper used by both routes
+def to2d_batch_strict(x1d):
+    """Return [N,T,4,1]. Collapse any accidental channels to 1."""
+    out = []
+    for w in x1d:                                # w: [T,4]
+        mn, mx = float(np.min(w)), float(np.max(w))
+        scale = (mx - mn) if (mx > mn) else 1.0
+        normed = (w - mn) / (scale + 1e-6)       # [T,4]
+        out.append(normed[..., None])            # [T,4,1]
+    x2d = np.array(out, dtype=np.float32)        # [N,T,4,1]
+    if x2d.ndim == 3:
+        x2d = x2d[..., None]                     # ensure last dim exists
+    if x2d.shape[-1] != 1:
+        x2d = np.mean(x2d, axis=-1, keepdims=True)  # collapse -> 1 channel
+    return x2d
+
+@app.post("/echo-shapes")
+def echo_shapes():
+    payload = request.get_json(silent=True) or {}
+    x1d_raw = np.array(payload.get("x1d", []), dtype=np.float32)
+    x2d_raw = to2d_batch_strict(x1d_raw)
+    return jsonify({"x1d_raw": _shape(x1d_raw), "x2d_raw": _shape(x2d_raw)})
+
 @app.post("/predict")
 def predict():
     # 1) Lazy load models
@@ -202,18 +231,10 @@ def predict():
     if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
         return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}"}), 400
 
-    # 3) Build simple 2D representation [N,T,4,1]
-    def to2d_batch(x1d):
-        out = []
-        for w in x1d:
-            mn, mx = float(np.min(w)), float(np.max(w))
-            normed = (w - mn) / (mx - mn + 1e-6)
-            out.append(normed[..., None])
-        return np.array(out, dtype=np.float32)
+    # 3) Build strict 2D [N,T,4,1]
+    x2d_raw = to2d_batch_strict(x1d_raw)
 
-    x2d_raw = to2d_batch(x1d_raw)
-
-    # 4) Load/ensure norms
+    # 4) Load/ensure norms (broadcastable)
     mu1, sg1 = _load_norm_file(os.path.join("norm", "cnn1d_data_anysafe.npz"))
     mu2, sg2 = _load_norm_file(os.path.join("norm", "cnn2d_data_anysafe.npz"))
     mu1, sg1 = _ensure_mu_sigma(mu1, sg1, feature_shape=(4,))
@@ -225,6 +246,15 @@ def predict():
         mu2[..., None] if mu2.ndim == 1 else mu2,
         sg2[..., None] if sg2.ndim == 1 else sg2
     )
+
+    # Optional: only show shapes, skip inference
+    if request.args.get("shapes") == "1":
+        return jsonify({
+            "x1d_raw": _shape(x1d_raw),
+            "x2d_raw": _shape(x2d_raw),
+            "x1d": _shape(x1d),
+            "x2d": _shape(x2d),
+        })
 
     # 5) Inference
     try:
@@ -254,6 +284,7 @@ def predict():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+
 
 
 
