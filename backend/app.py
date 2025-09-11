@@ -76,6 +76,30 @@ def _to_logits(p, eps=1e-7):
     p = np.clip(p, eps, 1. - eps)
     return np.log(p/(1.-p))
 
+# Force 2D stats to broadcast as (1,1,4,1) against x2d [N,T,4,1]
+def _as_2d_stat(arr_1d_or_2d):
+    """
+    Convert mu/sigma arrays like (4,), (4,1), (1,4) into shape (1,1,4,1)
+    so broadcasting preserves the final channel dimension = 1.
+    """
+    a = np.array(arr_1d_or_2d, dtype=np.float32)
+    if a.ndim == 1:            # (4,)
+        a = a.reshape(1, 1, 4, 1)
+    elif a.ndim == 2:          # (4,1) or (1,4)
+        if a.shape == (4, 1):
+            a = a.reshape(1, 1, 4, 1)
+        elif a.shape == (1, 4):
+            a = a.T.reshape(1, 1, 4, 1)
+        else:
+            a = a.reshape(-1)[:4].reshape(1, 1, 4, 1)
+    else:
+        a = a.squeeze()
+        if a.ndim == 1 and a.size >= 4:
+            a = a[:4].reshape(1, 1, 4, 1)
+        else:
+            a = np.zeros((1, 1, 4, 1), dtype=np.float32)
+    return a
+
 # ---------- Ensemble combine ----------
 ENSEMBLE_MODEL = None  # optional
 def combine_window_probs(p1, p2):
@@ -241,11 +265,11 @@ def predict():
     mu2, sg2 = _ensure_mu_sigma(mu2, sg2, feature_shape=(4,))
 
     x1d = normalize(x1d_raw, mu1, sg1)
-    x2d = normalize(
-        x2d_raw,
-        mu2[..., None] if mu2.ndim == 1 else mu2,
-        sg2[..., None] if sg2.ndim == 1 else sg2
-    )
+
+    # --- Force stats to align with [N,T,4,1] exactly ---
+    mu2_e = _as_2d_stat(mu2)     # (1,1,4,1)
+    sg2_e = _as_2d_stat(sg2)     # (1,1,4,1)
+    x2d = (x2d_raw - mu2_e) / (sg2_e + 1e-6)
 
     # Optional: only show shapes, skip inference
     if request.args.get("shapes") == "1":
@@ -284,8 +308,3 @@ def predict():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
-
-
-
-
-
