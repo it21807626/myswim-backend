@@ -1,4 +1,4 @@
-import os, json, threading
+import os, json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
@@ -17,6 +17,14 @@ class PatchedInputLayer(K.layers.InputLayer):
 # Also map DTypePolicy used in old graphs
 CUSTOMS = {"InputLayer": PatchedInputLayer, "DTypePolicy": mp.Policy}
 
+# Feature order from your CSV
+FEATURE_NAMES = [
+    "left_knee_angle",
+    "right_knee_angle",
+    "left_shoulder_angle",
+    "right_shoulder_angle",
+]
+
 app = Flask(__name__)
 CORS(app)
 
@@ -26,9 +34,6 @@ def _shape(x):
         return list(x.shape)
     except Exception:
         return None
-
-def _pid_tid():
-    return {"pid": os.getpid(), "thread": threading.get_ident()}
 
 # ---------- Config & manifest ----------
 with open(os.path.join("config", "ensemble_manifest.json"), "r") as f:
@@ -81,6 +86,10 @@ def _to_logits(p, eps=1e-7):
 
 # Force 2D stats to broadcast as (1,1,4,1) against x2d [N,T,4,1]
 def _as_2d_stat(arr_1d_or_2d):
+    """
+    Convert mu/sigma arrays like (4,), (4,1), (1,4) into shape (1,1,4,1)
+    so broadcasting preserves the final channel dimension = 1.
+    """
     a = np.array(arr_1d_or_2d, dtype=np.float32)
     if a.ndim == 1:            # (4,)
         a = a.reshape(1, 1, 4, 1)
@@ -149,6 +158,10 @@ def build_cnn2d(input_shape=(30, 4, 1)):
     return K.Model(x_in, out, name="functional_3")
 
 def robust_load_or_rebuild(h5_path: str, kind: str):
+    """
+    Try normal load_model (with CUSTOMS). If legacy-graph errors occur,
+    rebuild the architecture and load only weights by name.
+    """
     try:
         return tf.keras.models.load_model(h5_path, compile=False, custom_objects=CUSTOMS)
     except Exception:
@@ -191,14 +204,51 @@ def get_model_2d():
             raise
     return _MODEL_2D
 
+# ---------- 2D construction ----------
+def to2d_batch_strict(x1d):
+    """Return [N,T,4,1]. Collapse any accidental channels to 1."""
+    out = []
+    for w in x1d:                                # w: [T,4]
+        mn, mx = float(np.min(w)), float(np.max(w))
+        scale = (mx - mn) if (mx > mn) else 1.0
+        normed = (w - mn) / (scale + 1e-6)       # [T,4]
+        out.append(normed[..., None])            # [T,4,1]
+    x2d = np.array(out, dtype=np.float32)        # [N,T,4,1]
+    if x2d.ndim == 3:
+        x2d = x2d[..., None]                     # ensure last dim exists
+    if x2d.shape[-1] != 1:
+        x2d = np.mean(x2d, axis=-1, keepdims=True)  # collapse -> 1 channel
+    return x2d
+
+# ---------- simple attribution on normalized 1D ----------
+def _top_features_from_norm_window(z_win, top_k=2):
+    """
+    z_win: [T,4] absolute normalized values for one window.
+    Returns top_k feature names with largest mean magnitude.
+    """
+    scores = z_win.mean(axis=0)  # (4,)
+    order  = np.argsort(scores)[::-1]
+    return [FEATURE_NAMES[i] for i in order[:top_k]]
+
+def _overall_top_features(z_all, win_probs, th, top_k=2):
+    """
+    z_all: [N,T,4] abs normalized windows
+    win_probs: [N]
+    th: threshold for "risky" windows
+    Returns overall top_k features aggregated over risky windows.
+    """
+    idx = np.where(win_probs >= th)[0]
+    if idx.size == 0:
+        idx = np.array([int(np.argmax(win_probs))])
+    # mean score per feature over selected windows
+    feat_scores = np.mean([z_all[i].mean(axis=0) for i in idx], axis=0)  # (4,)
+    order = np.argsort(feat_scores)[::-1]
+    return [FEATURE_NAMES[i] for i in order[:top_k]]
+
 # ---------- Routes ----------
 @app.get("/")
 def root():
     return jsonify({"message": "myswim backend up", "tf": tf.__version__})
-
-@app.get("/whoami")
-def whoami():
-    return jsonify(_pid_tid())
 
 @app.get("/health")
 def health():
@@ -211,39 +261,14 @@ def health():
         "stride": STRIDE,
         "aggregate": AGGREGATE,
         "threshold": get_threshold(),
-        **_pid_tid(),
     })
-
-def to2d_batch_strict(x1d):
-    """Return [N,T,4,1]. Collapse any accidental channels to 1."""
-    out = []
-    for w in x1d:
-        mn, mx = float(np.min(w)), float(np.max(w))
-        scale = (mx - mn) if (mx > mn) else 1.0
-        normed = (w - mn) / (scale + 1e-6)
-        out.append(normed[..., None])
-    x2d = np.array(out, dtype=np.float32)
-    if x2d.ndim == 3:
-        x2d = x2d[..., None]
-    if x2d.shape[-1] != 1:
-        x2d = np.mean(x2d, axis=-1, keepdims=True)
-    return x2d
 
 @app.post("/echo-shapes")
 def echo_shapes():
     payload = request.get_json(silent=True) or {}
     x1d_raw = np.array(payload.get("x1d", []), dtype=np.float32)
     x2d_raw = to2d_batch_strict(x1d_raw)
-    return jsonify({"x1d_raw": _shape(x1d_raw), "x2d_raw": _shape(x2d_raw), **_pid_tid()})
-
-@app.get("/warmup")
-def warmup():
-    try:
-        _ = get_model_1d()
-        _ = get_model_2d()
-        return jsonify({"ok": True, "models_ready": True, **_pid_tid()})
-    except Exception as e:
-        return jsonify({"ok": False, "models_ready": False, "error": f"{type(e).__name__}: {e}", **_pid_tid()}), 500
+    return jsonify({"x1d_raw": _shape(x1d_raw), "x2d_raw": _shape(x2d_raw)})
 
 @app.post("/predict")
 def predict():
@@ -252,16 +277,16 @@ def predict():
         model_1d = get_model_1d()
         model_2d = get_model_2d()
     except Exception as e:
-        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}", **_pid_tid()}), 500
+        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}"}), 500
 
     # 2) Read payload
     payload = request.get_json(silent=True)
     if not payload or "x1d" not in payload:
-        return jsonify({"error": "Send JSON with key 'x1d' shaped [N,T,4]", **_pid_tid()}), 400
+        return jsonify({"error": "Send JSON with key 'x1d' shaped [N,T,4]"}), 400
 
     x1d_raw = np.array(payload["x1d"], dtype=np.float32)
     if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
-        return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}", **_pid_tid()}), 400
+        return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}"}), 400
 
     # 3) Build strict 2D [N,T,4,1]
     x2d_raw = to2d_batch_strict(x1d_raw)
@@ -273,7 +298,6 @@ def predict():
     mu2, sg2 = _ensure_mu_sigma(mu2, sg2, feature_shape=(4,))
 
     x1d = normalize(x1d_raw, mu1, sg1)
-
     # --- Force stats to align with [N,T,4,1] exactly ---
     mu2_e = _as_2d_stat(mu2)     # (1,1,4,1)
     sg2_e = _as_2d_stat(sg2)     # (1,1,4,1)
@@ -286,7 +310,6 @@ def predict():
             "x2d_raw": _shape(x2d_raw),
             "x1d": _shape(x1d),
             "x2d": _shape(x2d),
-            **_pid_tid(),
         })
 
     # 5) Inference
@@ -294,7 +317,7 @@ def predict():
         p1 = np.atleast_1d(model_1d.predict(x1d, verbose=0).squeeze())
         p2 = np.atleast_1d(model_2d.predict(x2d, verbose=0).squeeze())
     except Exception as e:
-        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}", **_pid_tid()}), 500
+        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}"}), 500
 
     n = min(len(p1), len(p2))
     p1, p2 = p1[:n], p2[:n]
@@ -306,17 +329,36 @@ def predict():
     th = get_threshold()
     decision = "Risky" if clip_prob >= th else "Safe"
 
+    # 6) Simple per-feature attribution on normalized 1D
+    z_all = np.abs(x1d[:n])                 # [N,T,4], abs normalized magnitudes
+    per_window_top = []
+    for i in range(n):
+        per_window_top.append(_top_features_from_norm_window(z_all[i], top_k=2))
+    risky_overall = _overall_top_features(z_all, win_probs, th, top_k=2)
+
     return jsonify({
         "decision": decision,
         "prob": float(clip_prob),
         "th": float(th),
         "window_probs": [float(v) for v in win_probs],
         "model_probs": {"p1d_mean": float(np.mean(p1)), "p2d_mean": float(np.mean(p2))},
-        "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE},
-        **_pid_tid(),
+        "risky_features_overall": risky_overall,
+        "per_window_top_features": per_window_top,
+        "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE}
     })
+
+# ---- Warmup + single-worker debug (optional) ----
+@app.get("/warmup")
+def warmup():
+    try:
+        _ = get_model_1d()
+        _ = get_model_2d()
+        return jsonify({"ok": True, "models_ready": True, "pid": os.getpid(), "thread": int(tf.experimental.get_cudnn_enabled())})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+
 
 
