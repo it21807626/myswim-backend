@@ -17,13 +17,13 @@ ENV PYTHONUNBUFFERED=1 \
 # Workdir
 WORKDIR /app
 
-# Install Python deps (kept separate for better cache)
+# Install deps from repo-root requirements.txt
 COPY requirements.txt ./
-RUN python -m pip install --upgrade pip && \
-    pip install -r requirements.txt
+RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy the rest of the backend (app.py, models/, config/, norm/, gunicorn_start.sh, etc.)
-COPY backend/ .
+# Copy entire repo, then run from backend/
+COPY . .
+WORKDIR /app/backend
 
 RUN chmod +x gunicorn_start.sh
 
