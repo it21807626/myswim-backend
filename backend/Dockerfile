@@ -14,28 +14,20 @@ ENV PYTHONUNBUFFERED=1 \
     TF_CPP_MIN_LOG_LEVEL=2 \
     PORT=5000
 
-# Workdir
+# Copy everything, then run from repo root
 WORKDIR /app
-
-# Install deps from repo-root requirements.txt
-COPY requirements.txt ./
-RUN python -m pip install --upgrade pip && pip install -r requirements.txt
-
-# Copy entire repo, then run from backend/
 COPY . .
-WORKDIR /app/backend
 
-RUN chmod +x gunicorn_start.sh
+# If your script is at backend/gunicorn_start.sh (most likely):
+RUN chmod +x backend/gunicorn_start.sh
 
-# (Optional) container port hint
+# Healthcheck
 EXPOSE 5000
-
-# Simple healthcheck hits your /health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -f http://127.0.0.1:${PORT:-5000}/health || exit 1
 
-# Start with your wrapper (keeps your current worker/thread settings)
-CMD ["bash", "gunicorn_start.sh"]
+# Start: cd into backend and run the script
+CMD ["bash", "-lc", "cd backend && ./gunicorn_start.sh"]
 
 
  
