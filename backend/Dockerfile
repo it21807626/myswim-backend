@@ -18,16 +18,16 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY . .
 
-# If your script is at backend/gunicorn_start.sh (most likely):
-RUN chmod +x backend/gunicorn_start.sh
+# Script is in repo root
+RUN chmod +x gunicorn_start.sh
 
 # Healthcheck
 EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -f http://127.0.0.1:${PORT:-5000}/health || exit 1
 
-# Start: cd into backend and run the script
-CMD ["bash", "-lc", "cd backend && ./gunicorn_start.sh"]
+# Start from repo root
+CMD ["bash","-lc","./gunicorn_start.sh"]
 
 
  
