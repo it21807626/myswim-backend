@@ -14,20 +14,17 @@ ENV PYTHONUNBUFFERED=1 \
     TF_CPP_MIN_LOG_LEVEL=2 \
     PORT=5000
 
-# Copy everything, then run from repo root
+# Copy everything and run from repo root (where app.py is)
 WORKDIR /app
 COPY . .
 
-# Script is in repo root
-RUN chmod +x gunicorn_start.sh
-
-# Healthcheck
 EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -f http://127.0.0.1:${PORT:-5000}/health || exit 1
 
-# Start from repo root
-CMD ["bash","-lc","./gunicorn_start.sh"]
+# Run Gunicorn via python -m (avoids PATH issues)
+CMD ["bash","-lc","exec python -m gunicorn app:app -w 1 -k gthread --threads 8 -b 0.0.0.0:${PORT:-5000} --timeout 180"]
+
 
 
  
