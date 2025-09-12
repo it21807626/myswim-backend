@@ -23,7 +23,7 @@ RUN python -m pip install --upgrade pip && \
     pip install -r requirements.txt
 
 # Copy the rest of the backend (app.py, models/, config/, norm/, gunicorn_start.sh, etc.)
-COPY . .
+COPY backend/ .
 
 RUN chmod +x gunicorn_start.sh
 
