@@ -1,10 +1,12 @@
-import os, json
+import os, json, tempfile
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras as K
 from tensorflow.keras import mixed_precision as mp
+import cv2
+import mediapipe as mpipe  # alias to avoid clashing with keras mixed_precision alias 'mp'
 
 # ---- Patch legacy InputLayer configs (batch_shape -> batch_input_shape)
 class PatchedInputLayer(K.layers.InputLayer):
@@ -245,6 +247,144 @@ def _overall_top_features(z_all, win_probs, th, top_k=2):
     order = np.argsort(feat_scores)[::-1]
     return [FEATURE_NAMES[i] for i in order[:top_k]]
 
+# ---------- Shared predictor for JSON and video paths ----------
+def predict_from_x1d(x1d_raw: np.ndarray):
+    """x1d_raw: [N,T,4] in the CSV feature order. Returns Flask jsonify(...) + status."""
+    # 1) Lazy load
+    try:
+        model_1d = get_model_1d()
+        model_2d = get_model_2d()
+    except Exception as e:
+        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}"}), 500
+
+    if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
+        return jsonify({"error": f"x1d must be [N,T,4], got {list(x1d_raw.shape)}"}), 400
+
+    # 2) Strict 2D and norms
+    x2d_raw = to2d_batch_strict(x1d_raw)
+    mu1, sg1 = _load_norm_file(os.path.join("norm", "cnn1d_data_anysafe.npz"))
+    mu2, sg2 = _load_norm_file(os.path.join("norm", "cnn2d_data_anysafe.npz"))
+    mu1, sg1 = _ensure_mu_sigma(mu1, sg1, feature_shape=(4,))
+    mu2, sg2 = _ensure_mu_sigma(mu2, sg2, feature_shape=(4,))
+
+    x1d = normalize(x1d_raw, mu1, sg1)
+    mu2_e = _as_2d_stat(mu2); sg2_e = _as_2d_stat(sg2)
+    x2d = (x2d_raw - mu2_e) / (sg2_e + 1e-6)
+
+    # 3) Inference
+    try:
+        p1 = np.atleast_1d(model_1d.predict(x1d, verbose=0).squeeze())
+        p2 = np.atleast_1d(model_2d.predict(x2d, verbose=0).squeeze())
+    except Exception as e:
+        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}"}), 500
+
+    n = min(len(p1), len(p2))
+    p1, p2 = p1[:n], p2[:n]
+    win_probs = combine_window_probs(p1, p2)
+    if len(win_probs) != n:
+        win_probs = win_probs[:n]
+
+    clip_prob = aggregate_clip(win_probs)
+    th = get_threshold()
+    decision = "Risky" if clip_prob >= th else "Safe"
+
+    # 4) Simple attribution on normalized 1D
+    z_all = np.abs(x1d[:n])                 # [N,T,4], abs normalized magnitudes
+    per_window_top = []
+    for i in range(n):
+        per_window_top.append(_top_features_from_norm_window(z_all[i], top_k=2))
+    risky_overall = _overall_top_features(z_all, win_probs, th, top_k=2)
+
+    return jsonify({
+        "decision": decision,
+        "prob": float(clip_prob),
+        "th": float(th),
+        "window_probs": [float(v) for v in win_probs],
+        "model_probs": {"p1d_mean": float(np.mean(p1)), "p2d_mean": float(np.mean(p2))},
+        "risky_features_overall": risky_overall,
+        "per_window_top_features": per_window_top,
+        "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE}
+    }), 200
+
+# ---------- Video -> angles -> windows ----------
+# MediaPipe landmark indices we need
+_LS, _RS = 11, 12
+_LE, _RE = 13, 14
+_LH, _RH = 23, 24
+_LK, _RK = 25, 26
+_LA, _RA = 27, 28
+
+def _angle_abc(a, b, c):
+    """Angle at point b (degrees) for segments ba, bc. a,b,c are (x,y)."""
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9)
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def _frame_angles_landmarks(lm):
+    """Return [left_knee, right_knee, left_shoulder, right_shoulder] from landmarks."""
+    def pt(i): 
+        return (lm[i].x, lm[i].y)
+    # Knees: hip-knee-ankle
+    lk = _angle_abc(pt(_LH), pt(_LK), pt(_LA))
+    rk = _angle_abc(pt(_RH), pt(_RK), pt(_RA))
+    # Shoulders: elbow-shoulder-hip
+    ls = _angle_abc(pt(_LE), pt(_LS), pt(_LH))
+    rs = _angle_abc(pt(_RE), pt(_RS), pt(_RH))
+    return [lk, rk, ls, rs]
+
+def extract_x1d_from_video(video_path: str, window: int = WINDOW, stride: int = STRIDE, max_frames: int = 5000):
+    """Returns np.ndarray [N, window, 4] using MediaPipe Pose on the video."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video")
+
+    values = []  # per-frame [4]
+    with mpipe.solutions.pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as pose:
+        i = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok or i >= max_frames: break
+            i += 1
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = pose.process(rgb)
+            if res.pose_landmarks is None:
+                continue
+            lm = res.pose_landmarks.landmark
+            values.append(_frame_angles_landmarks(lm))
+    cap.release()
+
+    if len(values) == 0:
+        raise RuntimeError("No pose detected in video")
+
+    arr = np.array(values, dtype=np.float32)  # [F,4]
+
+    # Make sliding windows [N, window, 4]
+    F = arr.shape[0]
+    if F < window:
+        # pad by repeating last
+        pad = np.tile(arr[-1], (window - F, 1))
+        arr = np.vstack([arr, pad])
+        F = arr.shape[0]
+
+    windows = []
+    for start in range(0, max(F - window + 1, 1), stride):
+        end = start + window
+        if end <= F:
+            windows.append(arr[start:end])
+    if not windows:
+        windows.append(arr[-window:])
+
+    x1d = np.stack(windows, axis=0).astype(np.float32)  # [N,window,4]
+    return x1d
+
 # ---------- Routes ----------
 @app.get("/")
 def root():
@@ -272,80 +412,29 @@ def echo_shapes():
 
 @app.post("/predict")
 def predict():
-    # 1) Lazy load models
-    try:
-        model_1d = get_model_1d()
-        model_2d = get_model_2d()
-    except Exception as e:
-        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}"}), 500
-
-    # 2) Read payload
+    # 1) Read payload
     payload = request.get_json(silent=True)
     if not payload or "x1d" not in payload:
         return jsonify({"error": "Send JSON with key 'x1d' shaped [N,T,4]"}), 400
 
     x1d_raw = np.array(payload["x1d"], dtype=np.float32)
-    if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
-        return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}"}), 400
+    return predict_from_x1d(x1d_raw)
 
-    # 3) Build strict 2D [N,T,4,1]
-    x2d_raw = to2d_batch_strict(x1d_raw)
+@app.post("/analyze")
+@app.post("/api/analyze")
+def analyze_video():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded. Use multipart/form-data with field 'file'."}), 400
 
-    # 4) Load/ensure norms (broadcastable)
-    mu1, sg1 = _load_norm_file(os.path.join("norm", "cnn1d_data_anysafe.npz"))
-    mu2, sg2 = _load_norm_file(os.path.join("norm", "cnn2d_data_anysafe.npz"))
-    mu1, sg1 = _ensure_mu_sigma(mu1, sg1, feature_shape=(4,))
-    mu2, sg2 = _ensure_mu_sigma(mu2, sg2, feature_shape=(4,))
+    with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as tmp:
+        f.save(tmp.name)
+        try:
+            x1d = extract_x1d_from_video(tmp.name, window=WINDOW, stride=STRIDE)
+        except Exception as e:
+            return jsonify({"error": "Video parsing failed", "detail": f"{type(e).__name__}: {e}"}), 400
 
-    x1d = normalize(x1d_raw, mu1, sg1)
-    # --- Force stats to align with [N,T,4,1] exactly ---
-    mu2_e = _as_2d_stat(mu2)     # (1,1,4,1)
-    sg2_e = _as_2d_stat(sg2)     # (1,1,4,1)
-    x2d = (x2d_raw - mu2_e) / (sg2_e + 1e-6)
-
-    # Optional: only show shapes, skip inference
-    if request.args.get("shapes") == "1":
-        return jsonify({
-            "x1d_raw": _shape(x1d_raw),
-            "x2d_raw": _shape(x2d_raw),
-            "x1d": _shape(x1d),
-            "x2d": _shape(x2d),
-        })
-
-    # 5) Inference
-    try:
-        p1 = np.atleast_1d(model_1d.predict(x1d, verbose=0).squeeze())
-        p2 = np.atleast_1d(model_2d.predict(x2d, verbose=0).squeeze())
-    except Exception as e:
-        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}"}), 500
-
-    n = min(len(p1), len(p2))
-    p1, p2 = p1[:n], p2[:n]
-    win_probs = combine_window_probs(p1, p2)
-    if len(win_probs) != n:
-        win_probs = win_probs[:n]
-
-    clip_prob = aggregate_clip(win_probs)
-    th = get_threshold()
-    decision = "Risky" if clip_prob >= th else "Safe"
-
-    # 6) Simple per-feature attribution on normalized 1D
-    z_all = np.abs(x1d[:n])                 # [N,T,4], abs normalized magnitudes
-    per_window_top = []
-    for i in range(n):
-        per_window_top.append(_top_features_from_norm_window(z_all[i], top_k=2))
-    risky_overall = _overall_top_features(z_all, win_probs, th, top_k=2)
-
-    return jsonify({
-        "decision": decision,
-        "prob": float(clip_prob),
-        "th": float(th),
-        "window_probs": [float(v) for v in win_probs],
-        "model_probs": {"p1d_mean": float(np.mean(p1)), "p2d_mean": float(np.mean(p2))},
-        "risky_features_overall": risky_overall,
-        "per_window_top_features": per_window_top,
-        "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE}
-    })
+    return predict_from_x1d(x1d)
 
 # ---- Warmup + single-worker debug (optional) ----
 @app.get("/warmup")
@@ -353,12 +442,13 @@ def warmup():
     try:
         _ = get_model_1d()
         _ = get_model_2d()
-        return jsonify({"ok": True, "models_ready": True, "pid": os.getpid(), "thread": int(tf.experimental.get_cudnn_enabled())})
+        return jsonify({"ok": True, "models_ready": True, "pid": os.getpid()})
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+
 
 
 
