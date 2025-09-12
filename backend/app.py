@@ -1,13 +1,35 @@
-import os, json, tempfile
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import os, json, gc, math, tempfile
+from typing import List, Tuple
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras as K
 from tensorflow.keras import mixed_precision as mp
-import cv2
-import mediapipe as mpipe  # alias to avoid clashing with keras mixed_precision alias 'mp'
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
+# Optional heavy deps; imported at top so cold start loads once
+import cv2
+import mediapipe as mp_solutions
+from werkzeug.utils import secure_filename
+
+# =======================
+#   App / Runtime Limits
+# =======================
+app = Flask(__name__)
+CORS(app)
+
+# Reject very large uploads (change via env if needed)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_CONTENT_LENGTH_MB', '40')) * 1024 * 1024  # 40 MB
+
+# Lightweight decode knobs (override via env)
+TARGET_WIDTH  = int(os.environ.get('TARGET_WIDTH',  '480'))   # resize frames to <= this width
+TARGET_FPS    = int(os.environ.get('TARGET_FPS',    '10'))    # sample to ~N fps
+MAX_SECONDS   = int(os.environ.get('MAX_SECONDS',   '15'))    # cap per request
+
+# ================
+#  Model Plumbing
+# ================
 # ---- Patch legacy InputLayer configs (batch_shape -> batch_input_shape)
 class PatchedInputLayer(K.layers.InputLayer):
     @classmethod
@@ -26,9 +48,6 @@ FEATURE_NAMES = [
     "left_shoulder_angle",
     "right_shoulder_angle",
 ]
-
-app = Flask(__name__)
-CORS(app)
 
 # ---------- small debug util ----------
 def _shape(x):
@@ -93,9 +112,9 @@ def _as_2d_stat(arr_1d_or_2d):
     so broadcasting preserves the final channel dimension = 1.
     """
     a = np.array(arr_1d_or_2d, dtype=np.float32)
-    if a.ndim == 1:            # (4,)
+    if a.ndim == 1:
         a = a.reshape(1, 1, 4, 1)
-    elif a.ndim == 2:          # (4,1) or (1,4)
+    elif a.ndim == 2:
         if a.shape == (4, 1):
             a = a.reshape(1, 1, 4, 1)
         elif a.shape == (1, 4):
@@ -160,10 +179,8 @@ def build_cnn2d(input_shape=(30, 4, 1)):
     return K.Model(x_in, out, name="functional_3")
 
 def robust_load_or_rebuild(h5_path: str, kind: str):
-    """
-    Try normal load_model (with CUSTOMS). If legacy-graph errors occur,
-    rebuild the architecture and load only weights by name.
-    """
+    """Try normal load_model (with CUSTOMS). If legacy-graph errors occur,
+    rebuild the architecture and load only weights by name."""
     try:
         return tf.keras.models.load_model(h5_path, compile=False, custom_objects=CUSTOMS)
     except Exception:
@@ -217,66 +234,159 @@ def to2d_batch_strict(x1d):
         out.append(normed[..., None])            # [T,4,1]
     x2d = np.array(out, dtype=np.float32)        # [N,T,4,1]
     if x2d.ndim == 3:
-        x2d = x2d[..., None]                     # ensure last dim exists
+        x2d = x2d[..., None]
     if x2d.shape[-1] != 1:
-        x2d = np.mean(x2d, axis=-1, keepdims=True)  # collapse -> 1 channel
+        x2d = np.mean(x2d, axis=-1, keepdims=True)
     return x2d
 
 # ---------- simple attribution on normalized 1D ----------
 def _top_features_from_norm_window(z_win, top_k=2):
-    """
-    z_win: [T,4] absolute normalized values for one window.
-    Returns top_k feature names with largest mean magnitude.
-    """
+    """z_win: [T,4] absolute normalized values for one window -> top_k names."""
     scores = z_win.mean(axis=0)  # (4,)
     order  = np.argsort(scores)[::-1]
     return [FEATURE_NAMES[i] for i in order[:top_k]]
 
 def _overall_top_features(z_all, win_probs, th, top_k=2):
-    """
-    z_all: [N,T,4] abs normalized windows
-    win_probs: [N]
-    th: threshold for "risky" windows
-    Returns overall top_k features aggregated over risky windows.
-    """
+    """Aggregate over risky windows; fallback to the max-prob window."""
     idx = np.where(win_probs >= th)[0]
     if idx.size == 0:
         idx = np.array([int(np.argmax(win_probs))])
-    # mean score per feature over selected windows
     feat_scores = np.mean([z_all[i].mean(axis=0) for i in idx], axis=0)  # (4,)
     order = np.argsort(feat_scores)[::-1]
     return [FEATURE_NAMES[i] for i in order[:top_k]]
 
-# ---------- Shared predictor for JSON and video paths ----------
-def predict_from_x1d(x1d_raw: np.ndarray):
-    """x1d_raw: [N,T,4] in the CSV feature order. Returns Flask jsonify(...) + status."""
-    # 1) Lazy load
+# -----------------------------
+#    Pose → 4 angles helpers
+# -----------------------------
+LM = mp_solutions.solutions.pose.PoseLandmark
+
+def _angle(a, b, c) -> float:
+    """Return angle at point b (in degrees) for points a-b-c, given as (x,y)."""
+    ax, ay = a; bx, by = b; cx, cy = c
+    v1 = np.array([ax - bx, ay - by], dtype=np.float32)
+    v2 = np.array([cx - bx, cy - by], dtype=np.float32)
+    dot = float(np.dot(v1, v2))
+    n1 = float(np.linalg.norm(v1)) + 1e-8
+    n2 = float(np.linalg.norm(v2)) + 1e-8
+    cosang = np.clip(dot / (n1 * n2), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def _extract_frame_angles(lms) -> Tuple[float, float, float, float]:
+    """Return (L_knee, R_knee, L_shoulder, R_shoulder) degrees."""
+    # Coordinates in image-space (x,y)
+    def xy(idx):
+        p = lms.landmark[idx]
+        return (p.x, p.y)
+
+    # Knees: hip-knee-ankle
+    lk = _angle(xy(LM.LEFT_HIP),  xy(LM.LEFT_KNEE),  xy(LM.LEFT_ANKLE))
+    rk = _angle(xy(LM.RIGHT_HIP), xy(LM.RIGHT_KNEE), xy(LM.RIGHT_ANKLE))
+
+    # Shoulders: elbow-shoulder-hip
+    ls = _angle(xy(LM.LEFT_ELBOW),  xy(LM.LEFT_SHOULDER),  xy(LM.LEFT_HIP))
+    rs = _angle(xy(LM.RIGHT_ELBOW), xy(LM.RIGHT_SHOULDER), xy(LM.RIGHT_HIP))
+
+    return (lk, rk, ls, rs)
+
+def _video_to_feature_sequence(video_path: str) -> Tuple[np.ndarray, float]:
+    """Decode video with downscale/FPS sampling/cap. Return features [F,4] and approx fps_used."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open video")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    sample_every = max(1, int(round(fps / max(1, TARGET_FPS))))
+    max_frames = int(MAX_SECONDS * fps)
+    processed = 0
+    feats: List[Tuple[float, float, float, float]] = []
+
+    with mp_solutions.solutions.pose.Pose(
+        static_image_mode=False, model_complexity=0,
+        enable_segmentation=False, smooth_landmarks=True
+    ) as pose:
+        while True:
+            # Skip frames to hit target FPS
+            for _ in range(sample_every - 1):
+                if not cap.grab():
+                    break
+                processed += 1
+                if processed >= max_frames:
+                    break
+
+            ok, frame = cap.read()
+            if not ok or processed >= max_frames:
+                break
+            processed += 1
+
+            # Downscale to limit RAM/CPU
+            if TARGET_WIDTH and frame.shape[1] > TARGET_WIDTH:
+                scale = TARGET_WIDTH / frame.shape[1]
+                frame = cv2.resize(frame, (int(frame.shape[1] * scale),
+                                           int(frame.shape[0] * scale)))
+
+            # BGR → RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = pose.process(rgb)
+            if not res.pose_landmarks:
+                continue
+
+            lk, rk, ls, rs = _extract_frame_angles(res.pose_landmarks)
+            feats.append((lk, rk, ls, rs))
+
+    cap.release()
+    gc.collect()
+    if len(feats) == 0:
+        raise RuntimeError("No pose landmarks detected")
+
+    fps_used = max(1.0, fps / sample_every)
+    return np.array(feats, dtype=np.float32), float(fps_used)
+
+def _windows_from_sequence(seq_f4: np.ndarray, win: int, stride: int) -> np.ndarray:
+    """seq_f4: [F,4] → [N,win,4] sliding windows; pad tail if too short."""
+    F = seq_f4.shape[0]
+    if F < win:
+        pad = np.repeat(seq_f4[-1:], win - F, axis=0)
+        return np.expand_dims(np.concatenate([seq_f4, pad], axis=0), 0)
+
+    windows = []
+    for s in range(0, F - win + 1, stride):
+        windows.append(seq_f4[s:s+win])
+    if not windows:
+        windows.append(seq_f4[-win:])
+    return np.stack(windows, axis=0)
+
+# ------------
+#  Inference
+# ------------
+def _infer_on_x1d(x1d_raw: np.ndarray):
+    """Run both models on x1d_raw [N,T,4] and return the final JSON payload."""
+    # 1) Models
     try:
         model_1d = get_model_1d()
         model_2d = get_model_2d()
     except Exception as e:
-        return jsonify({"error": "Model load failed", "detail": f"{type(e).__name__}: {e}"}), 500
+        return {"error": "Model load failed", "detail": f"{type(e).__name__}: {e}"}, 500
 
-    if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
-        return jsonify({"error": f"x1d must be [N,T,4], got {list(x1d_raw.shape)}"}), 400
-
-    # 2) Strict 2D and norms
+    # 2) Build strict 2D [N,T,4,1]
     x2d_raw = to2d_batch_strict(x1d_raw)
+
+    # 3) Norms
     mu1, sg1 = _load_norm_file(os.path.join("norm", "cnn1d_data_anysafe.npz"))
     mu2, sg2 = _load_norm_file(os.path.join("norm", "cnn2d_data_anysafe.npz"))
     mu1, sg1 = _ensure_mu_sigma(mu1, sg1, feature_shape=(4,))
     mu2, sg2 = _ensure_mu_sigma(mu2, sg2, feature_shape=(4,))
 
     x1d = normalize(x1d_raw, mu1, sg1)
-    mu2_e = _as_2d_stat(mu2); sg2_e = _as_2d_stat(sg2)
+    mu2_e = _as_2d_stat(mu2)     # (1,1,4,1)
+    sg2_e = _as_2d_stat(sg2)     # (1,1,4,1)
     x2d = (x2d_raw - mu2_e) / (sg2_e + 1e-6)
 
-    # 3) Inference
+    # 4) Inference
     try:
         p1 = np.atleast_1d(model_1d.predict(x1d, verbose=0).squeeze())
         p2 = np.atleast_1d(model_2d.predict(x2d, verbose=0).squeeze())
     except Exception as e:
-        return jsonify({"error": "Inference failed", "detail": f"{type(e).__name__}: {e}"}), 500
+        return {"error": "Inference failed", "detail": f"{type(e).__name__}: {e}"}, 500
 
     n = min(len(p1), len(p2))
     p1, p2 = p1[:n], p2[:n]
@@ -288,14 +398,14 @@ def predict_from_x1d(x1d_raw: np.ndarray):
     th = get_threshold()
     decision = "Risky" if clip_prob >= th else "Safe"
 
-    # 4) Simple attribution on normalized 1D
+    # 5) Simple per-feature attribution on normalized 1D
     z_all = np.abs(x1d[:n])                 # [N,T,4], abs normalized magnitudes
     per_window_top = []
     for i in range(n):
         per_window_top.append(_top_features_from_norm_window(z_all[i], top_k=2))
     risky_overall = _overall_top_features(z_all, win_probs, th, top_k=2)
 
-    return jsonify({
+    payload = {
         "decision": decision,
         "prob": float(clip_prob),
         "th": float(th),
@@ -304,88 +414,12 @@ def predict_from_x1d(x1d_raw: np.ndarray):
         "risky_features_overall": risky_overall,
         "per_window_top_features": per_window_top,
         "meta": {"window": WINDOW, "stride": STRIDE, "aggregate": AGGREGATE}
-    }), 200
+    }
+    return payload, 200
 
-# ---------- Video -> angles -> windows ----------
-# MediaPipe landmark indices we need
-_LS, _RS = 11, 12
-_LE, _RE = 13, 14
-_LH, _RH = 23, 24
-_LK, _RK = 25, 26
-_LA, _RA = 27, 28
-
-def _angle_abc(a, b, c):
-    """Angle at point b (degrees) for segments ba, bc. a,b,c are (x,y)."""
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9)
-    cosang = np.clip(cosang, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cosang)))
-
-def _frame_angles_landmarks(lm):
-    """Return [left_knee, right_knee, left_shoulder, right_shoulder] from landmarks."""
-    def pt(i): 
-        return (lm[i].x, lm[i].y)
-    # Knees: hip-knee-ankle
-    lk = _angle_abc(pt(_LH), pt(_LK), pt(_LA))
-    rk = _angle_abc(pt(_RH), pt(_RK), pt(_RA))
-    # Shoulders: elbow-shoulder-hip
-    ls = _angle_abc(pt(_LE), pt(_LS), pt(_LH))
-    rs = _angle_abc(pt(_RE), pt(_RS), pt(_RH))
-    return [lk, rk, ls, rs]
-
-def extract_x1d_from_video(video_path: str, window: int = WINDOW, stride: int = STRIDE, max_frames: int = 5000):
-    """Returns np.ndarray [N, window, 4] using MediaPipe Pose on the video."""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open video")
-
-    values = []  # per-frame [4]
-    with mpipe.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as pose:
-        i = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok or i >= max_frames: break
-            i += 1
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = pose.process(rgb)
-            if res.pose_landmarks is None:
-                continue
-            lm = res.pose_landmarks.landmark
-            values.append(_frame_angles_landmarks(lm))
-    cap.release()
-
-    if len(values) == 0:
-        raise RuntimeError("No pose detected in video")
-
-    arr = np.array(values, dtype=np.float32)  # [F,4]
-
-    # Make sliding windows [N, window, 4]
-    F = arr.shape[0]
-    if F < window:
-        # pad by repeating last
-        pad = np.tile(arr[-1], (window - F, 1))
-        arr = np.vstack([arr, pad])
-        F = arr.shape[0]
-
-    windows = []
-    for start in range(0, max(F - window + 1, 1), stride):
-        end = start + window
-        if end <= F:
-            windows.append(arr[start:end])
-    if not windows:
-        windows.append(arr[-window:])
-
-    x1d = np.stack(windows, axis=0).astype(np.float32)  # [N,window,4]
-    return x1d
-
-# ---------- Routes ----------
+# ===========
+#   Routes
+# ===========
 @app.get("/")
 def root():
     return jsonify({"message": "myswim backend up", "tf": tf.__version__})
@@ -401,6 +435,12 @@ def health():
         "stride": STRIDE,
         "aggregate": AGGREGATE,
         "threshold": get_threshold(),
+        "limits": {
+            "TARGET_WIDTH": TARGET_WIDTH,
+            "TARGET_FPS": TARGET_FPS,
+            "MAX_SECONDS": MAX_SECONDS,
+            "MAX_CONTENT_MB": app.config['MAX_CONTENT_LENGTH'] // (1024*1024),
+        }
     })
 
 @app.post("/echo-shapes")
@@ -412,31 +452,60 @@ def echo_shapes():
 
 @app.post("/predict")
 def predict():
-    # 1) Read payload
+    """Raw JSON input: {"x1d": [[...],[...],...]} shaped [N,T,4]."""
     payload = request.get_json(silent=True)
     if not payload or "x1d" not in payload:
         return jsonify({"error": "Send JSON with key 'x1d' shaped [N,T,4]"}), 400
 
     x1d_raw = np.array(payload["x1d"], dtype=np.float32)
-    return predict_from_x1d(x1d_raw)
+    if x1d_raw.ndim != 3 or x1d_raw.shape[-1] != 4:
+        return jsonify({"error": f"x1d must be [N,T,4], got {x1d_raw.shape}"}), 400
 
-@app.post("/analyze")
+    # Optional: shapes only
+    if request.args.get("shapes") == "1":
+        return jsonify({
+            "x1d_raw": _shape(x1d_raw),
+            "x2d_raw": _shape(to2d_batch_strict(x1d_raw)),
+        })
+
+    out, code = _infer_on_x1d(x1d_raw)
+    return (jsonify(out), code)
+
 @app.post("/api/analyze")
 def analyze_video():
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "No file uploaded. Use multipart/form-data with field 'file'."}), 400
+    """Accepts multipart/form-data with 'file' (mp4/mov), extracts 4 angles,
+       builds [N,T,4] windows, runs inference, and returns the same JSON schema."""
+    if 'file' not in request.files:
+        return jsonify({"error": "Upload a file under form field 'file'"}), 400
 
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as tmp:
-        f.save(tmp.name)
-        try:
-            x1d = extract_x1d_from_video(tmp.name, window=WINDOW, stride=STRIDE)
-        except Exception as e:
-            return jsonify({"error": "Video parsing failed", "detail": f"{type(e).__name__}: {e}"}), 400
+    f = request.files['file']
+    if f.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
 
-    return predict_from_x1d(x1d)
+    fname = secure_filename(f.filename)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = os.path.join(td, fname or "clip.mp4")
+            f.save(tmp_path)
 
-# ---- Warmup + single-worker debug (optional) ----
+            # Video → per-frame 4 angles
+            seq_f4, fps_used = _video_to_feature_sequence(tmp_path)
+
+            # Sequence → [N,WINDOW,4]
+            x1d_raw = _windows_from_sequence(seq_f4, WINDOW, STRIDE)
+
+            out, code = _infer_on_x1d(x1d_raw)
+            if code != 200:
+                return jsonify(out), code
+
+            # include fps used for optional UI time-axis
+            out["meta"]["fps_used"] = fps_used
+            return jsonify(out), 200
+    except Exception as e:
+        return jsonify({"error": "Video analysis failed", "detail": f"{type(e).__name__}: {e}"}), 500
+    finally:
+        gc.collect()
+
 @app.get("/warmup")
 def warmup():
     try:
@@ -447,8 +516,5 @@ def warmup():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 if __name__ == "__main__":
+    # Local dev
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
-
-
-
-
