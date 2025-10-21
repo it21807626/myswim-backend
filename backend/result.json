@@ -1,0 +1,40 @@
+{
+    "IsMutuallyAuthenticated":  false,
+    "Cookies":  [
+
+                ],
+    "Headers":  [
+                    "Transfer-Encoding",
+                    "Connection",
+                    "access-control-allow-origin",
+                    "rndr-id",
+                    "vary",
+                    "x-render-origin-server",
+                    "cf-cache-status",
+                    "CF-RAY",
+                    "alt-svc",
+                    "Content-Type",
+                    "Date",
+                    "Server"
+                ],
+    "SupportsHeaders":  true,
+    "ContentLength":  -1,
+    "ContentEncoding":  "",
+    "ContentType":  "application/json",
+    "CharacterSet":  "",
+    "Server":  "cloudflare",
+    "LastModified":  "\/Date(1757705950758)\/",
+    "StatusCode":  500,
+    "StatusDescription":  "Internal Server Error",
+    "ProtocolVersion":  {
+                            "Major":  1,
+                            "Minor":  1,
+                            "Build":  -1,
+                            "Revision":  -1,
+                            "MajorRevision":  -1,
+                            "MinorRevision":  -1
+                        },
+    "ResponseUri":  "https://myswim-backend.onrender.com/predict",
+    "Method":  "POST",
+    "IsFromCache":  false
+}

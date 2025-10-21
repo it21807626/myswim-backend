@@ -355,6 +355,63 @@ def _windows_from_sequence(seq_f4: np.ndarray, win: int, stride: int) -> np.ndar
         windows.append(seq_f4[-win:])
     return np.stack(windows, axis=0)
 
+# -----------------------------
+#   Quick "is swimming?" gate
+# -----------------------------
+def _blue_ratio(frame_bgr):
+    """Return fraction of 'blue-ish' pixels in frame (0..1)."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    # OpenCV H range: 0..179; pool water often ~90..140, widen a bit:
+    lower = np.array([85,  40,  40], dtype=np.uint8)
+    upper = np.array([140, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    return float(np.count_nonzero(mask)) / float(mask.size)
+
+def quick_swim_check(video_path: str,
+                     sample_every:int = 5,     # sample every Nth frame
+                     max_samples:int = 150,    # cap work
+                     min_pose_frames:int = 12, # >= this many frames with pose
+                     min_avg_blue:float = 0.10 # >=10% blue-ish pixels on average
+                     ):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video for validation")
+
+    pose_frames = 0
+    blue_scores = []
+
+    with mp_solutions.solutions.pose.Pose(
+        static_image_mode=False, model_complexity=0,
+        enable_segmentation=False, min_detection_confidence=0.5, min_tracking_confidence=0.5
+    ) as pose:
+        i = 0
+        taken = 0
+        while taken < max_samples:
+            ok = cap.grab()
+            if not ok:
+                break
+            if i % sample_every == 0:
+                ok, frame = cap.retrieve()
+                if not ok:
+                    break
+                blue_scores.append(_blue_ratio(frame))
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = pose.process(rgb)
+                if res.pose_landmarks is not None:
+                    pose_frames += 1
+                taken += 1
+            i += 1
+
+    cap.release()
+
+    if not blue_scores:
+        return {"is_swimming": False, "pose_frames": 0, "avg_blue": 0.0}
+
+    avg_blue = float(np.mean(blue_scores))
+    is_swim = (pose_frames >= min_pose_frames) and (avg_blue >= min_avg_blue)
+    return {"is_swimming": bool(is_swim), "pose_frames": int(pose_frames), "avg_blue": avg_blue}
+
+
 # ------------
 #  Inference
 # ------------
@@ -469,7 +526,27 @@ def predict():
         })
 
     out, code = _infer_on_x1d(x1d_raw)
-    return (jsonify(out), code)
+    
+@app.post("/validate")
+@app.post("/api/validate")
+def validate_video():
+    if 'file' not in request.files:
+        return jsonify({"error": "Upload a file under form field 'file'"}), 400
+
+    f = request.files['file']
+    if f.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+
+    fname = secure_filename(f.filename)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = os.path.join(td, fname or "clip.mp4")
+            f.save(tmp_path)
+            res = quick_swim_check(tmp_path)
+            return jsonify({"ok": True, **res}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
 
 @app.post("/api/analyze")
 def analyze_video():
@@ -487,6 +564,15 @@ def analyze_video():
         with tempfile.TemporaryDirectory() as td:
             tmp_path = os.path.join(td, fname or "clip.mp4")
             f.save(tmp_path)
+
+            gate = quick_swim_check(tmp_path)
+            if not gate.get("is_swimming", False):
+                return jsonify({
+                    "error": "Not a swimming clip",
+                    "is_swimming": False,
+                    "pose_frames": gate.get("pose_frames", 0),
+                    "avg_blue": gate.get("avg_blue", 0.0)
+                }), 422
 
             # Video → per-frame 4 angles
             seq_f4, fps_used = _video_to_feature_sequence(tmp_path)
