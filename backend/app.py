@@ -526,7 +526,8 @@ def predict():
         })
 
     out, code = _infer_on_x1d(x1d_raw)
-    
+    return (jsonify(out), code)
+
 @app.post("/validate")
 @app.post("/api/validate")
 def validate_video():
@@ -543,19 +544,9 @@ def validate_video():
             tmp_path = os.path.join(td, fname or "clip.mp4")
             f.save(tmp_path)
             res = quick_swim_check(tmp_path)
-            if not res.get("is_swimming", False):
-    # Friendly, consistent message for the app
-              return jsonify({
-                  "ok": False,
-                  "is_swimming": False,
-                  "message": "Not a valid swimming video"
-              }), 200
+            res = quick_swim_check(tmp_path)
+            return jsonify({"ok": True, **res}), 200
 
-# Still a valid swim clip
-            return jsonify({
-                "ok": True,
-                "is_swimming": True
-            }), 200
 
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
@@ -581,10 +572,11 @@ def analyze_video():
             gate = quick_swim_check(tmp_path)
             if not gate.get("is_swimming", False):
                 return jsonify({
-                    "ok": False,
+                    "error": "Not a swimming clip",
                     "is_swimming": False,
-                    "message": "Not a valid swimming video"
-                }), 200
+                    "pose_frames": gate.get("pose_frames", 0),
+                    "avg_blue": gate.get("avg_blue", 0.0)
+                }), 422
 
 
             # Video → per-frame 4 angles
