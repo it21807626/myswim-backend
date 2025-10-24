@@ -13,11 +13,82 @@ import cv2
 import mediapipe as mp_solutions
 from werkzeug.utils import secure_filename
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # =======================
 #   App / Runtime Limits
 # =======================
 app = Flask(__name__)
 CORS(app)
+
+import datetime as _dt
+from sqlalchemy import create_engine, Column, Integer, Float, String, Text, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Local fallback: SQLite file
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///myswim.db"
+# Render may supply postgres://; SQLAlchemy expects postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
+
+class VideoValidation(Base):
+    __tablename__ = "video_validation"
+    id          = Column(Integer, primary_key=True)
+    filename    = Column(String(255))
+    is_swimming = Column(Integer)        # 1/0 (bool)
+    pose_frames = Column(Integer)
+    avg_blue    = Column(Float)
+    client_ip   = Column(String(64))
+    created_at  = Column(DateTime, default=_dt.datetime.utcnow)
+
+class AnalysisResult(Base):
+    __tablename__ = "analysis_result"
+    id          = Column(Integer, primary_key=True)
+    filename    = Column(String(255))
+    decision    = Column(String(32))
+    prob        = Column(Float)
+    th          = Column(Float)
+    window_cnt  = Column(Integer)
+    risky_overall_json = Column(Text)    # JSON-serialized list
+    per_win_top_json   = Column(Text)    # JSON-serialized list[list]
+    meta_json          = Column(Text)    # JSON-serialized dict
+    client_ip   = Column(String(64))
+    created_at  = Column(DateTime, default=_dt.datetime.utcnow)
+
+# Create tables automatically (simple for this project)
+try:
+    Base.metadata.create_all(engine)
+except Exception as _e:
+    print("[DB] create_all failed:", _e)
+
+def _client_ip(req):
+    return req.headers.get("X-Forwarded-For", "").split(",")[0].strip() or req.remote_addr or ""
+
+@app.get("/db/health")
+def db_health():
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1;")
+        return jsonify({
+            "ok": True,
+            "driver": engine.url.drivername,
+            "url_scheme": (os.getenv("DATABASE_URL", "")[:12].rstrip(":")),
+            "can_connect": True
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+
 
 # Reject very large uploads (change via env if needed)
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_CONTENT_LENGTH_MB', '40')) * 1024 * 1024  # 40 MB
@@ -544,7 +615,20 @@ def validate_video():
             tmp_path = os.path.join(td, fname or "clip.mp4")
             f.save(tmp_path)
             res = quick_swim_check(tmp_path)
-            res = quick_swim_check(tmp_path)
+
+            try:
+                with SessionLocal() as s:
+                    s.add(VideoValidation(
+                        filename=fname,
+                        is_swimming=1 if res.get("is_swimming") else 0,
+                        pose_frames=int(res.get("pose_frames", 0)),
+                        avg_blue=float(res.get("avg_blue", 0.0)),
+                        client_ip=_client_ip(request),
+                    ))
+                    s.commit()
+            except Exception as _e:
+                print("[DB] validate insert failed:", _e)
+
             return jsonify({"ok": True, **res}), 200
 
 
@@ -588,6 +672,23 @@ def analyze_video():
             out, code = _infer_on_x1d(x1d_raw)
             if code != 200:
                 return jsonify(out), code
+            
+            try:
+                with SessionLocal() as s:
+                    s.add(AnalysisResult(
+                        filename=fname,
+                        decision=out.get("decision"),
+                        prob=float(out.get("prob", 0.0)),
+                        th=float(out.get("th", 0.0)),
+                        window_cnt=len(out.get("window_probs", []) or []),
+                        risky_overall_json=json.dumps(out.get("risky_features_overall", [])),
+                        per_win_top_json=json.dumps(out.get("per_window_top_features", [])),
+                        meta_json=json.dumps(out.get("meta", {})),
+                        client_ip=_client_ip(request),
+                    ))
+                    s.commit()
+            except Exception as _e:
+                print("[DB] analyze insert failed:", _e)
 
             # include fps used for optional UI time-axis
             out["meta"]["fps_used"] = fps_used
@@ -605,6 +706,8 @@ def warmup():
         return jsonify({"ok": True, "models_ready": True, "pid": os.getpid()})
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    
+
 
 if __name__ == "__main__":
     # Local dev
