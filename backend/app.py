@@ -39,6 +39,7 @@ engine = create_engine(
     pool_pre_ping=True,
     future=True,
 )
+print("[DB] Using:", engine.url)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
@@ -71,6 +72,33 @@ try:
     Base.metadata.create_all(engine)
 except Exception as _e:
     print("[DB] create_all failed:", _e)
+
+def _result_summary(row: AnalysisResult):
+    try:
+        top = json.loads(row.risky_overall_json or "[]")
+    except Exception:
+        top = []
+    return {
+        "id": row.id,
+        "created_at": row.created_at.isoformat() + "Z" if row.created_at else None,
+        "prob": float(row.prob) if row.prob is not None else None,
+        "decision": row.decision,
+        "top_joint": (top[0] if top else None),
+    }
+
+def _result_detail(row: AnalysisResult):
+    return {
+        "id": row.id,
+        "filename": row.filename,
+        "created_at": row.created_at.isoformat() + "Z" if row.created_at else None,
+        "prob": float(row.prob) if row.prob is not None else None,
+        "th": float(row.th) if row.th is not None else None,
+        "decision": row.decision,
+        "window_cnt": int(row.window_cnt) if row.window_cnt is not None else None,
+        "risky_features_overall": json.loads(row.risky_overall_json or "[]"),
+        "per_window_top_features": json.loads(row.per_win_top_json or "[]"),
+        "meta": json.loads(row.meta_json or "{}"),
+    }    
 
 def _client_ip(req):
     return req.headers.get("X-Forwarded-For", "").split(",")[0].strip() or req.remote_addr or ""
@@ -571,6 +599,39 @@ def health():
         }
     })
 
+@app.get("/routes")
+def routes():
+    return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
+
+@app.get("/db/recent")
+def db_recent():
+    """Return recent analysis results, newest first.
+       Query params: limit (default 20, max 100)"""
+    try:
+        limit = int(request.args.get("limit", 20))
+    except Exception:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    with SessionLocal() as s:
+        rows = (
+            s.query(AnalysisResult)
+            .order_by(AnalysisResult.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return jsonify([_result_summary(r) for r in rows]), 200
+
+
+@app.get("/db/result/<int:rid>")
+def db_result(rid: int):
+    """Return full detail for a single analysis result by id."""
+    with SessionLocal() as s:
+        row = s.get(AnalysisResult, rid)
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(_result_detail(row)), 200
+
 @app.post("/echo-shapes")
 def echo_shapes():
     payload = request.get_json(silent=True) or {}
@@ -697,6 +758,37 @@ def analyze_video():
         return jsonify({"error": "Video analysis failed", "detail": f"{type(e).__name__}: {e}"}), 500
     finally:
         gc.collect()
+
+# ---- NEW: history endpoints ----
+@app.get("/api/results")
+def list_results():
+    """Return latest analysis summaries, newest first.
+       Optional ?limit=20 (1..100)."""
+    try:
+        limit = int(request.args.get("limit", 20))
+        limit = max(1, min(limit, 100))
+        with SessionLocal() as s:
+            rows = (
+                s.query(AnalysisResult)
+                 .order_by(AnalysisResult.created_at.desc(), AnalysisResult.id.desc())
+                 .limit(limit)
+                 .all()
+            )
+        return jsonify([_result_summary(r) for r in rows]), 200
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+@app.get("/api/results/<int:rid>")
+def get_result(rid: int):
+    """Return full details for one analysis result."""
+    try:
+        with SessionLocal() as s:
+            row = s.get(AnalysisResult, rid)
+            if not row:
+                return jsonify({"error": "Not found"}), 404
+        return jsonify(_result_detail(row)), 200
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 @app.get("/warmup")
 def warmup():
