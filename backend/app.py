@@ -730,9 +730,30 @@ def analyze_video():
             # Sequence → [N,WINDOW,4]
             x1d_raw = _windows_from_sequence(seq_f4, WINDOW, STRIDE)
 
+            # ---- Build frame index ranges for each analysis window (inclusive) ----
+            F = int(seq_f4.shape[0])
+            frame_ranges = []
+            if F < WINDOW:
+                frame_ranges.append([0, max(0, F - 1)])
+            else:
+                for s in range(0, F - WINDOW + 1, STRIDE):
+                    e = min(s + WINDOW - 1, F - 1)
+                    frame_ranges.append([s, e])
+
             out, code = _infer_on_x1d(x1d_raw)
             if code != 200:
                 return jsonify(out), code
+
+            # ---- Include raw angles and window ranges for frontend UI ----
+# seq_f4 shape is [F, 4] in order: [left_knee, right_knee, left_shoulder, right_shoulder]
+            out["angles"] = {
+                "per_frame": seq_f4.tolist(),        # list of [lk, rk, ls, rs] per frame
+                "windows": {
+                    "frame_ranges": frame_ranges,    # list of [start, end] (inclusive) per window
+                    "window": WINDOW,
+                    "stride": STRIDE,
+                },
+            }
 
             F = int(seq_f4.shape[0])
             win = int(WINDOW)
