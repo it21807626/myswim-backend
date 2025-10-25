@@ -733,6 +733,55 @@ def analyze_video():
             out, code = _infer_on_x1d(x1d_raw)
             if code != 200:
                 return jsonify(out), code
+
+            F = int(seq_f4.shape[0])
+            win = int(WINDOW)
+            st  = int(STRIDE)
+
+# Frame ranges for each sliding window (aligned with _windows_from_sequence)
+            if F < win:
+                frame_ranges = [[0, max(0, F - 1)]]
+            else:
+                frame_ranges = [[s, s + win - 1] for s in range(0, F - win + 1, st)]
+
+# Trim ranges to match the number of window probabilities returned
+            n_probs = len(out.get("window_probs", []) or [])
+            if n_probs and len(frame_ranges) > n_probs:
+                frame_ranges = frame_ranges[:n_probs]
+
+# Per-window mean angles (degrees) using the same frame slices
+            per_window_stats = []
+            for a, b in frame_ranges:
+                sl = seq_f4[a:b + 1, :]  # [frames_in_window, 4]
+                mean_deg = sl.mean(axis=0).tolist()
+                per_window_stats.append({
+                    "mean_deg": {
+                        "left_knee_angle":      float(mean_deg[0]),
+                        "right_knee_angle":     float(mean_deg[1]),
+                        "left_shoulder_angle":  float(mean_deg[2]),
+                        "right_shoulder_angle": float(mean_deg[3]),
+                    }
+                })
+
+# Per-frame angles (degrees) for plotting
+            per_frame = {
+                "left_knee_angle":      seq_f4[:, 0].astype(float).tolist(),
+                "right_knee_angle":     seq_f4[:, 1].astype(float).tolist(),
+                "left_shoulder_angle":  seq_f4[:, 2].astype(float).tolist(),
+                "right_shoulder_angle": seq_f4[:, 3].astype(float).tolist(),
+                "fps_used":             float(fps_used),
+            }
+
+# Attach to response
+            out["angles"] = {
+                "per_frame": per_frame,
+                "windows": {
+                    "window": win,
+                    "stride": st,
+                    "frame_ranges": frame_ranges,
+                    "per_window_stats": per_window_stats,
+                }
+            }
             
             try:
                 with SessionLocal() as s:
