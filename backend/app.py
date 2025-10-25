@@ -87,6 +87,14 @@ def _result_summary(row: AnalysisResult):
     }
 
 def _result_detail(row: AnalysisResult):
+    meta = {}
+    try:
+        meta = json.loads(row.meta_json or "{}")
+    except Exception:
+        meta = {}
+
+    angles = meta.get("angles")  # may be None for old rows
+
     return {
         "id": row.id,
         "filename": row.filename,
@@ -97,8 +105,10 @@ def _result_detail(row: AnalysisResult):
         "window_cnt": int(row.window_cnt) if row.window_cnt is not None else None,
         "risky_features_overall": json.loads(row.risky_overall_json or "[]"),
         "per_window_top_features": json.loads(row.per_win_top_json or "[]"),
-        "meta": json.loads(row.meta_json or "{}"),
-    }    
+        "meta": meta,
+        "angles": angles,   # <-- NEW: expose angles for details screen
+    }
+    
 
 def _client_ip(req):
     return req.headers.get("X-Forwarded-For", "").split(",")[0].strip() or req.remote_addr or ""
@@ -744,68 +754,60 @@ def analyze_video():
             if code != 200:
                 return jsonify(out), code
 
-            # ---- Include raw angles and window ranges for frontend UI ----
-# seq_f4 shape is [F, 4] in order: [left_knee, right_knee, left_shoulder, right_shoulder]
-            out["angles"] = {
-                "per_frame": seq_f4.tolist(),        # list of [lk, rk, ls, rs] per frame
-                "windows": {
-                    "frame_ranges": frame_ranges,    # list of [start, end] (inclusive) per window
-                    "window": WINDOW,
-                    "stride": STRIDE,
-                },
-            }
+                                # ---- include fps_used and attach angles, then persist angles ----
+            out["meta"]["fps_used"] = fps_used
 
-            F = int(seq_f4.shape[0])
-            win = int(WINDOW)
-            st  = int(STRIDE)
+            # Ensure per-frame angles exist in the response
+            if "angles" not in out:
+                # seq_f4 is [F,4] in order: [left_knee, right_knee, left_shoulder, right_shoulder]
+                F = int(seq_f4.shape[0])
 
-# Frame ranges for each sliding window (aligned with _windows_from_sequence)
-            if F < win:
-                frame_ranges = [[0, max(0, F - 1)]]
-            else:
-                frame_ranges = [[s, s + win - 1] for s in range(0, F - win + 1, st)]
+                # Build frame ranges for each sliding window
+                ranges = []
+                if F <= WINDOW:
+                    ranges.append([0, max(0, F - 1)])
+                else:
+                    for s_idx in range(0, F - WINDOW + 1, STRIDE):
+                        ranges.append([s_idx, min(F - 1, s_idx + WINDOW - 1)])
+                    if not ranges:
+                        ranges.append([max(0, F - WINDOW), F - 1])
 
-# Trim ranges to match the number of window probabilities returned
-            n_probs = len(out.get("window_probs", []) or [])
-            if n_probs and len(frame_ranges) > n_probs:
-                frame_ranges = frame_ranges[:n_probs]
+                # Simple window mean stats for each joint
+                per_win_stats = []
+                for a, b in ranges:
+                    w = seq_f4[a:b+1]  # [T,4]
+                    per_win_stats.append({
+                        "mean_deg": {
+                            "left_knee_angle":       float(np.mean(w[:, 0])),
+                            "right_knee_angle":      float(np.mean(w[:, 1])),
+                            "left_shoulder_angle":   float(np.mean(w[:, 2])),
+                            "right_shoulder_angle":  float(np.mean(w[:, 3])),
+                        }
+                    })
 
-# Per-window mean angles (degrees) using the same frame slices
-            per_window_stats = []
-            for a, b in frame_ranges:
-                sl = seq_f4[a:b + 1, :]  # [frames_in_window, 4]
-                mean_deg = sl.mean(axis=0).tolist()
-                per_window_stats.append({
-                    "mean_deg": {
-                        "left_knee_angle":      float(mean_deg[0]),
-                        "right_knee_angle":     float(mean_deg[1]),
-                        "left_shoulder_angle":  float(mean_deg[2]),
-                        "right_shoulder_angle": float(mean_deg[3]),
+                out["angles"] = {
+                    "per_frame": {
+                        "fps_used": float(fps_used),
+                        "left_knee_angle":      [float(v) for v in seq_f4[:, 0].tolist()],
+                        "right_knee_angle":     [float(v) for v in seq_f4[:, 1].tolist()],
+                        "left_shoulder_angle":  [float(v) for v in seq_f4[:, 2].tolist()],
+                        "right_shoulder_angle": [float(v) for v in seq_f4[:, 3].tolist()],
+                    },
+                    "windows": {
+                        "window": WINDOW,
+                        "stride": STRIDE,
+                        "frame_ranges": ranges,
+                        "per_window_stats": per_win_stats,
                     }
-                })
-
-# Per-frame angles (degrees) for plotting
-            per_frame = {
-                "left_knee_angle":      seq_f4[:, 0].astype(float).tolist(),
-                "right_knee_angle":     seq_f4[:, 1].astype(float).tolist(),
-                "left_shoulder_angle":  seq_f4[:, 2].astype(float).tolist(),
-                "right_shoulder_angle": seq_f4[:, 3].astype(float).tolist(),
-                "fps_used":             float(fps_used),
-            }
-
-# Attach to response
-            out["angles"] = {
-                "per_frame": per_frame,
-                "windows": {
-                    "window": win,
-                    "stride": st,
-                    "frame_ranges": frame_ranges,
-                    "per_window_stats": per_window_stats,
                 }
-            }
-            
+
+            # Persist to DB with angles embedded inside meta_json
             try:
                 with SessionLocal() as s:
+                    meta_to_save = dict(out.get("meta", {}))
+                    if "angles" in out:
+                        meta_to_save["angles"] = out["angles"]
+
                     s.add(AnalysisResult(
                         filename=fname,
                         decision=out.get("decision"),
@@ -814,16 +816,16 @@ def analyze_video():
                         window_cnt=len(out.get("window_probs", []) or []),
                         risky_overall_json=json.dumps(out.get("risky_features_overall", [])),
                         per_win_top_json=json.dumps(out.get("per_window_top_features", [])),
-                        meta_json=json.dumps(out.get("meta", {})),
+                        meta_json=json.dumps(meta_to_save),
                         client_ip=_client_ip(request),
                     ))
                     s.commit()
             except Exception as _e:
                 print("[DB] analyze insert failed:", _e)
 
-            # include fps used for optional UI time-axis
-            out["meta"]["fps_used"] = fps_used
             return jsonify(out), 200
+
+
     except Exception as e:
         return jsonify({"error": "Video analysis failed", "detail": f"{type(e).__name__}: {e}"}), 500
     finally:
